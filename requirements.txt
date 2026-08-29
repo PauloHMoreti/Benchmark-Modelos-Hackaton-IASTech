@@ -1,0 +1,10 @@
+torch>=2.1
+torchvision>=0.16
+transformers>=4.40
+scipy>=1.10
+pycocotools>=2.0.7
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+Pillow>=10.0
+tqdm>=4.66
