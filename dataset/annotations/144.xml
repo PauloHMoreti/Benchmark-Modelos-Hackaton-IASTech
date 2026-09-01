@@ -1,0 +1,37 @@
+<annotation>
+	<folder>my-project-name</folder>
+	<filename>144.jpg</filename>
+	<path>/my-project-name/144.jpg</path>
+	<source>
+		<database>Unspecified</database>
+	</source>
+	<size>
+		<width>997</width>
+		<height>799</height>
+		<depth>3</depth>
+	</size>
+	<object>
+		<name>Outro</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>43</xmin>
+			<ymin>22</ymin>
+			<xmax>400</xmax>
+			<ymax>661</ymax>
+		</bndbox>
+	</object>
+	<object>
+		<name>Outro</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>558</xmin>
+			<ymin>47</ymin>
+			<xmax>906</xmax>
+			<ymax>661</ymax>
+		</bndbox>
+	</object>
+</annotation>
