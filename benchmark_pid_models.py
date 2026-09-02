@@ -127,26 +127,92 @@ def default_collate(batch):
 # ==================================================================================
 
 
+def load_coco_utf8(ann_file):
+    """Carrega um json COCO sempre como UTF-8 e devolve um objeto COCO já
+    pronto (com createIndex() rodado).
+
+    `pycocotools.coco.COCO` abre o arquivo com `open(ann_file)`, SEM
+    especificar encoding - no Windows isso usa o codepage padrão do
+    sistema (não UTF-8), e nomes de classe com acento (ex.: "Conexão",
+    "Válvula") saem corrompidos ("ConexÃ£o", "VÃ¡lvula"). Isso por sua vez
+    quebrava o casamento de categorias por nome entre train/val. Lendo o
+    json nós mesmos, sempre em UTF-8, e só então entregando o dict pronto
+    para o pycocotools, evitamos depender do locale do sistema."""
+    with open(ann_file, encoding="utf-8") as f:
+        dataset = json.load(f)
+    coco = COCO()
+    coco.dataset = dataset
+    coco.createIndex()
+    return coco
+
+
+def build_canonical_categories(ann_files):
+    """Une as categorias de vários arquivos COCO (train.json e val.json) e
+    devolve a lista canônica de nomes de classe, em ordem alfabética.
+
+    Casa as categorias pelo NOME, não pelo id numérico. Várias ferramentas
+    de exportação COCO escrevem, no "categories" de cada split, só as
+    classes que aparecem NAQUELE split - e podem numerar os ids de forma
+    independente em cada arquivo (ex.: "Bomba" pode ser id=3 no train.json
+    e id=1 no val.json). Se confiássemos no id numérico, duas classes
+    diferentes poderiam acabar caindo no mesmo índice, e a avaliação ficaria
+    silenciosamente errada (ou quebraria mais na frente, como aconteceu no
+    cálculo de AP por classe)."""
+    names = []
+    seen = set()
+    for ann_file in ann_files:
+        with open(ann_file, encoding="utf-8") as f:
+            cats = json.load(f).get("categories", [])
+        for cat in cats:
+            if cat["name"] not in seen:
+                seen.add(cat["name"])
+                names.append(cat["name"])
+    return sorted(names)
+
+
+def remap_coco_to_canonical(coco: COCO, canonical_classes):
+    """Substitui o category_id de todas as categorias e anotações de um
+    objeto COCO já carregado pelo índice canônico (0..C-1, baseado no NOME
+    da categoria) e reconstrói os índices internos do pycocotools.
+
+    Depois disso, train e val "falam a mesma língua" de ids de classe,
+    mesmo que os jsons originais numerassem as categorias de forma
+    diferente entre si."""
+    name_to_canonical = {name: i for i, name in enumerate(canonical_classes)}
+    old_id_to_name = {cat["id"]: cat["name"] for cat in coco.dataset["categories"]}
+
+    for cat in coco.dataset["categories"]:
+        cat["id"] = name_to_canonical[cat["name"]]
+    for ann in coco.dataset["annotations"]:
+        ann["category_id"] = name_to_canonical[old_id_to_name[ann["category_id"]]]
+
+    coco.createIndex()
+
+
 class CocoDetectionRaw(Dataset):
     """Lê um dataset em formato COCO e devolve (PIL.Image, anotação cru).
 
     A anotação cru de cada imagem é um dict com a lista de anotações no
-    formato COCO original (bbox em [x, y, w, h], category_id = id ORIGINAL
-    do json de categorias). Cada wrapper de modelo (Faster R-CNN / RetinaNet
-    / RT-DETR) converte esse formato cru para o que a respectiva API espera -
-    isso evita duplicar a leitura do dataset três vezes.
+    formato COCO (bbox em [x, y, w, h], category_id JÁ remapeado para o
+    índice canônico 0..C-1 - ver `build_canonical_categories` /
+    `remap_coco_to_canonical`). Cada wrapper de modelo (Faster R-CNN /
+    RetinaNet / RT-DETR) converte esse formato cru para o que a respectiva
+    API espera - isso evita duplicar a leitura do dataset três vezes.
     """
 
-    def __init__(self, images_dir, ann_file):
+    def __init__(self, images_dir, ann_file, canonical_classes):
         self.images_dir = Path(images_dir)
-        self.coco = COCO(str(ann_file))
+        self.coco = load_coco_utf8(ann_file)
+        remap_coco_to_canonical(self.coco, canonical_classes)
         self.img_ids = sorted(self.coco.getImgIds())
 
-        # categorias originais do COCO json -> índice contíguo 0..C-1
-        cat_ids = sorted(self.coco.getCatIds())
-        self.catid2contig = {cid: i for i, cid in enumerate(cat_ids)}
-        self.contig2catid = {i: cid for cid, i in self.catid2contig.items()}
-        self.classes = [self.coco.cats[cid]["name"] for cid in cat_ids]
+        # após o remap, category_id JÁ É o índice contíguo 0..C-1, então
+        # catid2contig/contig2catid viram identidade - mantidos como dicts
+        # só para o restante do código (que já espera essa interface) não
+        # precisar mudar.
+        self.classes = list(canonical_classes)
+        self.catid2contig = {i: i for i in range(len(self.classes))}
+        self.contig2catid = {i: i for i in range(len(self.classes))}
 
     def __len__(self):
         return len(self.img_ids)
@@ -476,6 +542,12 @@ def run_coco_eval(coco_gt, predictions, class_names):
 
     coco_dt = coco_gt.loadRes(predictions)
     coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+    # Força a avaliação a cobrir TODAS as classes canônicas (0..C-1), não só
+    # as que por acaso aparecem no "categories" do json de validação. Uma
+    # classe rara sem nenhuma instância no split de val simplesmente entra
+    # com AP=-1/NaN (tratado em per_class_ap), em vez de encolher a
+    # dimensão do array de precisão e quebrar a extração por classe.
+    coco_eval.params.catIds = list(range(len(class_names)))
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
@@ -635,8 +707,15 @@ def main():
     else:
         data_dir = Path(args.data_dir)
 
-    ds_train = CocoDetectionRaw(data_dir / "images" / "train", data_dir / "annotations" / "train.json")
-    ds_val = CocoDetectionRaw(data_dir / "images" / "val", data_dir / "annotations" / "val.json")
+    train_ann = data_dir / "annotations" / "train.json"
+    val_ann = data_dir / "annotations" / "val.json"
+    # Casa as categorias de treino/validação pelo NOME antes de montar os
+    # datasets, para não depender de train.json e val.json numerarem as
+    # mesmas classes com os mesmos ids (ver build_canonical_categories).
+    canonical_classes = build_canonical_categories([train_ann, val_ann])
+
+    ds_train = CocoDetectionRaw(data_dir / "images" / "train", train_ann, canonical_classes)
+    ds_val = CocoDetectionRaw(data_dir / "images" / "val", val_ann, canonical_classes)
     num_classes = len(ds_train.classes)
     print(f"Classes ({num_classes}): {ds_train.classes}")
     print(f"Treino: {len(ds_train)} imagens | Validação: {len(ds_val)} imagens")
